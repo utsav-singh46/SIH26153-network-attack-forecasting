@@ -17,9 +17,16 @@ def load_dataset(file_path: str) -> pd.DataFrame:
 
 
 def clean_invalid_rows(df: pd.DataFrame) -> pd.DataFrame:
-    """Removes repeated header rows and parses valid timestamps using dayfirst=True."""
+    """Removes repeated header rows, parses valid timestamps, and normalizes label spelling variants."""
     # Filter out repeated CSV header rows accidentally embedded in the data
     df = df[df["Label"] != "Label"].copy()
+
+    # Clean whitespace from Label values
+    df["Label"] = df["Label"].astype(str).str.strip()
+
+    # The CSE-CIC-IDS2018 dataset contains a known typo where "Infiltration" is spelled "Infilteration".
+    # We normalize "Infilteration" -> "Infiltration" so downstream modules use canonical naming.
+    df["Label"] = df["Label"].replace({"Infilteration": "Infiltration"})
 
     # Convert Timestamp using dayfirst=True; invalid ones will become NaT and be dropped
     df["Timestamp"] = pd.to_datetime(df["Timestamp"], dayfirst=True, errors="coerce")
