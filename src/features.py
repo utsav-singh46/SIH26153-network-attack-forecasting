@@ -2,12 +2,16 @@ import os
 import numpy as np
 import pandas as pd
 
-# Paths to cleaned input dataset and aggregated network states output
+# Path definitions
 CLEANED_DATA_PATH = os.path.join("data", "processed", "cleaned_traffic.csv")
-OUTPUT_DATA_PATH = os.path.join("data", "processed", "network_states_30s.csv")
+NETWORK_STATES_PATH = os.path.join("data", "processed", "network_states_30s.csv")
+X_SEQUENCES_PATH = os.path.join("data", "processed", "X_sequences.npy")
+Y_SEQUENCES_PATH = os.path.join("data", "processed", "y_sequences.npy")
+METADATA_PATH = os.path.join("data", "processed", "sequence_metadata.csv")
 
-# Fixed temporal window size (30 seconds)
+# Configuration constants
 WINDOW_SIZE = "30s"
+SEQUENCE_LENGTH = 5  # Number of past 30-second states used to predict next state label
 
 
 def load_cleaned_dataset(file_path: str) -> pd.DataFrame:
@@ -42,8 +46,8 @@ def match_column(df_columns: pd.Index, candidates: list) -> str:
 
 def aggregate_network_states(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Groups individual network flow records into 30-second temporal windows
-    and computes aggregated network-state features and window-level target labels.
+    Groups individual network flow records into continuous 30-second temporal windows.
+    Preserves all empty/zero-flow intervals to maintain chronological timeline integrity.
     """
     cols = df.columns
 
@@ -88,13 +92,8 @@ def aggregate_network_states(df: pd.DataFrame) -> pd.DataFrame:
     # Unique entity counts
     if col_dst_port:
         aggregations["unique_destination_ports"] = (col_dst_port, "nunique")
-    else:
-        print("Note: Destination Port column not found. Skipping unique_destination_ports.")
-
     if col_protocol:
         aggregations["unique_protocols"] = (col_protocol, "nunique")
-    else:
-        print("Note: Protocol column not found. Skipping unique_protocols.")
 
     # Flow statistical averages and medians
     if col_duration:
@@ -109,80 +108,157 @@ def aggregate_network_states(df: pd.DataFrame) -> pd.DataFrame:
     if col_bwd_len_mean:
         aggregations["average_backward_packet_length"] = (col_bwd_len_mean, "mean")
 
-    # Perform window aggregation
+    # Perform window aggregation across the complete continuous timeframe
     window_df = resampled.agg(**aggregations).reset_index()
     window_df.rename(columns={"Timestamp": "window_start"}, inplace=True)
 
-    # Filter out empty time periods (windows with zero captured flows)
-    window_df = window_df[window_df["flow_count"] > 0].copy()
+    # DO NOT DROP ZERO-FLOW WINDOWS: Keep all 30-second windows intact
+    # Calculate infiltration_ratio safely for empty/zero-flow windows
+    window_df["infiltration_ratio"] = np.where(
+        window_df["flow_count"] > 0,
+        window_df["infiltration_flows"] / window_df["flow_count"],
+        0.0
+    )
 
-    # Calculate proportion of infiltration flows within each 30-second window
-    window_df["infiltration_ratio"] = window_df["infiltration_flows"] / window_df["flow_count"]
-
-    # Assign window label: "Infiltration" if any flow in the window was an attack, else "Benign"
+    # Assign window label: "Infiltration" if any attack flow occurred, else "Benign"
     window_df["Label"] = np.where(window_df["infiltration_flows"] > 0, "Infiltration", "Benign")
 
-    # Fill NaNs created by zero-duration divisions with 0
+    # Fill NaNs across all feature metrics (zero-flow windows get 0 values)
     numeric_cols = window_df.select_dtypes(include=[np.number]).columns
     window_df[numeric_cols] = window_df[numeric_cols].fillna(0)
 
     return window_df
 
 
-def generate_and_save_features():
-    """Main execution entry point for feature extraction and validation."""
-    print("Loading preprocessed flow data...")
+def create_temporal_sequences(states_df: pd.DataFrame, seq_len: int = 5):
+    """
+    Converts strictly continuous 30-second network state snapshots into sliding window sequence arrays (X, y)
+    for next-state network attack forecasting.
+
+    Input features: Only numeric network state metrics (excluding window_start, Label, infiltration_ratio).
+    Target y      : Next window's network attack state label (Benign -> 0, Infiltration -> 1).
+    """
+    # 1. Sort strictly chronologically by window_start
+    df = states_df.sort_values(by="window_start").reset_index(drop=True)
+
+    # 2. Exclude non-feature or data-leakage columns from model inputs
+    excluded_cols = ["window_start", "Label", "infiltration_ratio"]
+    feature_cols = [c for c in df.columns if c not in excluded_cols]
+
+    # Extract feature matrix (NumPy float32 array)
+    X_matrix = df[feature_cols].values.astype(np.float32)
+
+    # Map target Labels to integers: Benign -> 0, Infiltration -> 1
+    label_mapping = {"Benign": 0, "Infiltration": 1}
+    y_vector = df["Label"].map(label_mapping).values
+
+    num_samples = len(df)
+    X_seq_list = []
+    y_seq_list = []
+    metadata_records = []
+
+    # 3. Construct sliding window sequences: [t-4, t-3, t-2, t-1, t] -> target [t+1]
+    for i in range(num_samples - seq_len):
+        # Input sequence matrix of shape (seq_len, num_features)
+        X_seq = X_matrix[i : i + seq_len]
+        
+        # Target label corresponding to state at index i + seq_len (t + 1)
+        y_target = y_vector[i + seq_len]
+
+        X_seq_list.append(X_seq)
+        y_seq_list.append(y_target)
+
+        # Metadata tracking for validation and temporal alignment
+        metadata_records.append({
+            "sequence_index": i,
+            "input_start_window": df.loc[i, "window_start"],
+            "input_end_window": df.loc[i + seq_len - 1, "window_start"],
+            "target_window": df.loc[i + seq_len, "window_start"],
+            "target_label": df.loc[i + seq_len, "Label"],
+            "target_label_encoded": y_target,
+        })
+
+    # Convert to NumPy arrays while strictly maintaining chronological order
+    X_arr = np.array(X_seq_list, dtype=np.float32)
+    y_arr = np.array(y_seq_list, dtype=np.int64)
+    metadata_df = pd.DataFrame(metadata_records)
+
+    return X_arr, y_arr, metadata_df, feature_cols
+
+
+def run_feature_and_sequence_generation():
+    """Main workflow: Generates continuous 30s network states followed by temporal forecasting sequences."""
+    print("Step 1: Loading preprocessed traffic flows...")
     df_raw = load_cleaned_dataset(CLEANED_DATA_PATH)
     original_flow_rows = len(df_raw)
     original_infiltration_rows = int(df_raw["is_infiltration"].sum())
 
-    print("Grouping network flows into 30-second network-state windows...")
+    print("Step 2: Aggregating network flows into continuous 30-second network states...")
     df_windowed = aggregate_network_states(df_raw)
 
-    # Critical Validation Checks
-    reconciled_infiltration_sum = int(df_windowed["infiltration_flows"].sum())
-    windows_with_infiltration = (df_windowed["infiltration_flows"] > 0).sum()
+    # Reconcile raw flow infiltration sum
+    reconciled_infiltration = int(df_windowed["infiltration_flows"].sum())
+    assert original_infiltration_rows == reconciled_infiltration, "Infiltration flow sum mismatch!"
 
-    print("\n--- Critical Validation Check ---")
-    print(f"Total Infiltration Rows in Input : {original_infiltration_rows}")
-    print(f"Sum of Infiltration Flows        : {reconciled_infiltration_sum}")
-    print(f"Infiltration Flow Reconciliation : {original_infiltration_rows == reconciled_infiltration_sum}")
+    # Temporal continuity validation: Check difference between consecutive window timestamps
+    window_diffs = df_windowed["window_start"].diff().dropna()
+    min_gap = window_diffs.min()
+    max_gap = window_diffs.max()
+    is_continuous_30s = (min_gap == pd.Timedelta(seconds=30)) and (max_gap == pd.Timedelta(seconds=30))
 
-    print("\nSample Infiltration Windows (5 Examples):")
-    sample_cols = ["window_start", "flow_count", "infiltration_flows", "infiltration_ratio", "Label"]
-    sample_windows = df_windowed[df_windowed["infiltration_flows"] > 0][sample_cols].head(5)
-    print(sample_windows.to_string(index=False))
+    zero_flow_windows = (df_windowed["flow_count"] == 0).sum()
+    non_empty_windows = (df_windowed["flow_count"] > 0).sum()
+    total_windows = len(df_windowed)
 
-    # Drop intermediate counting helper column before final export
+    print("\n--- Temporal Continuity Validation ---")
+    print(f"Total 30-Second Windows    : {total_windows}")
+    print(f"Non-Empty Windows          : {non_empty_windows}")
+    print(f"Zero-Flow Windows          : {zero_flow_windows}")
+    print(f"Minimum Window Gap         : {min_gap}")
+    print(f"Maximum Window Gap         : {max_gap}")
+    print(f"Strict 30-Second Continuity: {is_continuous_30s}")
+
+    assert is_continuous_30s, "Validation Failed: Timeline contains non-30-second gaps!"
+
+    # Drop temporary counting helper column before export
     df_export = df_windowed.drop(columns=["infiltration_flows"])
 
-    # Save aggregated 30-second network states
-    os.makedirs(os.path.dirname(OUTPUT_DATA_PATH), exist_ok=True)
-    df_export.to_csv(OUTPUT_DATA_PATH, index=False)
+    # Save 30-second network states CSV
+    os.makedirs(os.path.dirname(NETWORK_STATES_PATH), exist_ok=True)
+    df_export.to_csv(NETWORK_STATES_PATH, index=False)
+    print(f"\nSaved complete network states to: {NETWORK_STATES_PATH}")
 
-    # Print Final Output Summary
-    total_windows = len(df_export)
-    benign_windows = (df_export["Label"] == "Benign").sum()
-    infiltration_windows = (df_export["Label"] == "Infiltration").sum()
-    min_ratio = df_export["infiltration_ratio"].min()
-    max_ratio = df_export["infiltration_ratio"].max()
+    # Step 3: Sequence creation for temporal forecasting
+    print("\nStep 3: Creating sliding window temporal sequences (sequence_length = 5)...")
+    X, y, metadata_df, feature_names = create_temporal_sequences(df_export, seq_len=SEQUENCE_LENGTH)
 
-    print("\n--- Final Network State Extraction Summary ---")
-    print(f"Original Flow Rows          : {original_flow_rows}")
-    print(f"30-Second Windows Generated : {total_windows}")
-    print(f"Start Window                : {df_export['window_start'].min()}")
-    print(f"End Window                  : {df_export['window_start'].max()}")
-    print(f"Benign Windows              : {benign_windows}")
-    print(f"Infiltration Windows        : {infiltration_windows}")
-    print(f"Min Infiltration Ratio      : {min_ratio:.4f}")
-    print(f"Max Infiltration Ratio      : {max_ratio:.4f}")
-    print(f"Total Infiltration Flows    : {reconciled_infiltration_sum}")
-    print(f"Total Feature Columns       : {df_export.shape[1]}")
-    print("\nFinal Column Names:")
-    for col in df_export.columns:
-        print(f" - {col}")
-    print(f"\nSaved 30-second network states to: {OUTPUT_DATA_PATH}\n")
+    # Save numpy arrays and metadata
+    np.save(X_SEQUENCES_PATH, X)
+    np.save(Y_SEQUENCES_PATH, y)
+    metadata_df.to_csv(METADATA_PATH, index=False)
+
+    print(f"Saved sequence inputs to: {X_SEQUENCES_PATH}")
+    print(f"Saved sequence targets to: {Y_SEQUENCES_PATH}")
+    print(f"Saved sequence metadata to: {METADATA_PATH}")
+
+    # Target distribution summary
+    unique_labels, counts = np.unique(y, return_counts=True)
+    target_counts_dict = dict(zip(unique_labels, counts))
+
+    print("\n--- Temporal Sequence Generation Summary ---")
+    print(f"Number of Network States : {len(df_export)}")
+    print(f"Sequence Length          : {SEQUENCE_LENGTH}")
+    print(f"Number of Input Features : {X.shape[2]}")
+    print(f"Number of Sequences      : {len(X)}")
+    print(f"X Shape                  : {X.shape}")
+    print(f"y Shape                  : {y.shape}")
+    print(f"Target Label Counts (y)  : Benign (0): {target_counts_dict.get(0, 0)}, Infiltration (1): {target_counts_dict.get(1, 0)}")
+
+    print("\nModel Input Feature Columns:")
+    for fn in feature_names:
+        print(f" - {fn}")
+    print("\nProcessing complete.\n")
 
 
 if __name__ == "__main__":
-    generate_and_save_features()
+    run_feature_and_sequence_generation()
